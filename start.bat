@@ -8,13 +8,16 @@ if not exist node_modules (
 REM Uncomment to pin a model and ignore whatever MCM is set to:
 REM set FORCE_MODEL=flash
 
-REM Fallback when the mod sends an unknown tag (flash / flash-3 / pro):
-REM set GEMINI_MODEL=flash
-
-REM How many gemini CLI processes to keep pre-spawned per model. Hides the
-REM ~2-5s CLI boot from each request, at the cost of ~150 MB RAM each.
-REM Set to 0 to disable and spawn cold every time (old behaviour).
-REM set GEMINI_POOL_SIZE=1
+REM Requires Antigravity CLI (`agy`) to be installed and logged in.
+REM The server captures `agy --print` through a PTY.
+REM Optional: pin an Antigravity model, otherwise your AGY default is used.
+REM set AGY_MODEL=gemini-3.5-flash
+REM Prompt mode: file avoids Windows command-line length limits.
+REM set AGY_PROMPT_MODE=file
+REM Optional temp root for per-request prompt files.
+REM set AGY_PROMPT_DIR=%TEMP%
+REM Optional: auto-approve AGY tool permissions. Use only if you trust the prompt.
+REM set AGY_SKIP_PERMISSIONS=1
 
 node server.js
 pause

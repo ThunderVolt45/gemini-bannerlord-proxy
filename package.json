@@ -3,11 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Ollama-compatible HTTP proxy that forwards Bannerlord AIInfluence mod requests to the Gemini CLI (Google account / Gemini subscription).",
+  "description": "Ollama-compatible HTTP proxy that forwards Bannerlord AIInfluence mod requests to Antigravity CLI.",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:agy": "node scripts/test-agy-print-capture.mjs",
+    "smoke:agy": "node scripts/smoke-agy-proxy.mjs"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "node-pty": "^1.1.0"
   }
 }

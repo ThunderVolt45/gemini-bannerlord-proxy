@@ -1,83 +1,45 @@
 import express from "express";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import pty from "node-pty";
 
 const PORT = Number(process.env.PORT || 11434);
 const HOST = process.env.HOST || "127.0.0.1";
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "flash";
-const REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 120_000);
-const POOL_SIZE_PER_MODEL = Math.max(0, Number(process.env.GEMINI_POOL_SIZE ?? 1));
-const POOL_MAX_AGE_MS = Number(process.env.GEMINI_POOL_MAX_AGE_MS ?? 5 * 60 * 1000);
+const REQUEST_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS || 120_000);
+const AGY_PRINT_TIMEOUT = process.env.AGY_PRINT_TIMEOUT || `${Math.ceil(REQUEST_TIMEOUT_MS / 1000)}s`;
+const AGY_PROMPT_MODE = (process.env.AGY_PROMPT_MODE || "file").toLowerCase();
+const AGY_PROMPT_DIR = process.env.AGY_PROMPT_DIR || os.tmpdir();
+const AGY_SKIP_PERMISSIONS = process.env.AGY_SKIP_PERMISSIONS === "1";
 
 const MODEL_ALIASES = {
-  flash: "gemini-2.5-flash-lite",
-  "flash-3": "gemini-3-flash-preview",
-  pro: "gemini-3-pro-preview",
+  flash: "gemini-3.5-flash",
+  "flash-3": "gemini-3.5-flash",
+  pro: "gemini-3-pro",
 };
 
-function resolveGeminiLauncher() {
-  // 1. Explicit override
-  if (process.env.GEMINI_CLI_JS && fs.existsSync(process.env.GEMINI_CLI_JS)) {
-    return { cmd: process.execPath, baseArgs: [process.env.GEMINI_CLI_JS], shell: false };
+function resolveAgyLauncher() {
+  if (process.env.AGY_CMD && fs.existsSync(process.env.AGY_CMD)) {
+    return process.env.AGY_CMD;
   }
 
   if (os.platform() === "win32") {
-    // 2. Read the .cmd shim and parse the real JS/EXE target out of it. This
-    // is the most reliable method because it works for non-standard npm
-    // prefixes (nvm-windows, scoop, custom --prefix, etc.).
     try {
-      const where = spawnSync("where", ["gemini.cmd"], { encoding: "utf8" });
-      const line = where.stdout.split(/\r?\n/).find((l) => l.trim().endsWith(".cmd"));
-      if (line) {
-        const cmdPath = line.trim();
-        const cmdDir = path.dirname(cmdPath);
-        const contents = fs.readFileSync(cmdPath, "utf8");
-        // Pull out every quoted path-with-extension that mentions node_modules
-        // (skips the node.exe self-reference in npm-generated shims). Expand
-        // %dp0% / %~dp0 to the shim's directory.
-        const matches = [...contents.matchAll(/"([^"]+node_modules[^"]+\.(?:js|exe))"/gi)];
-        for (const m of matches) {
-          const resolved = m[1].replace(/%~?dp0%\\?/gi, cmdDir + path.sep);
-          if (fs.existsSync(resolved)) {
-            if (resolved.toLowerCase().endsWith(".js")) {
-              return { cmd: process.execPath, baseArgs: [resolved], shell: false };
-            }
-            return { cmd: resolved, baseArgs: [], shell: false };
-          }
-        }
-        // Couldn't extract a usable target from the shim. Spawn the .cmd via
-        // shell:true so cmd.exe handles it. Safe because our big payload
-        // (the prompt) goes via stdin, not as an argument.
-        return { cmd: `"${cmdPath}"`, baseArgs: [], shell: true };
-      }
+      const where = spawnSync("where", ["agy"], { encoding: "utf8" });
+      const line = where.stdout.split(/\r?\n/).find((l) => l.trim().length > 0);
+      if (line && fs.existsSync(line.trim())) return line.trim();
     } catch {}
 
-    // 3. Known static install paths as a fallback (npm default prefix).
-    const npmRoots = [
-      path.join(process.env.APPDATA || "", "npm", "node_modules", "@google", "gemini-cli"),
-      path.join(os.homedir(), "AppData", "Roaming", "npm", "node_modules", "@google", "gemini-cli"),
-    ];
-    for (const root of npmRoots) {
-      if (!fs.existsSync(root)) continue;
-      const jsCandidates = [
-        path.join(root, "dist", "index.js"),
-        path.join(root, "dist", "src", "gemini.js"),
-        path.join(root, "bin", "gemini.js"),
-        path.join(root, "index.js"),
-      ];
-      for (const p of jsCandidates) {
-        if (fs.existsSync(p)) return { cmd: process.execPath, baseArgs: [p], shell: false };
-      }
-    }
+    const localAppData = process.env.LOCALAPPDATA || "";
+    const candidate = path.join(localAppData, "agy", "bin", "agy.exe");
+    if (fs.existsSync(candidate)) return candidate;
   }
 
-  // 4. Last resort: hope `gemini` is in PATH and let the shell find it.
-  return { cmd: "gemini", baseArgs: [], shell: true };
+  return "agy";
 }
 
-const GEMINI_LAUNCHER = resolveGeminiLauncher();
+const AGY_LAUNCHER = resolveAgyLauncher();
 
 const ADVERTISED_MODELS = [
   { tag: "gemini-flash:latest", alias: "flash" },
@@ -93,19 +55,16 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Map whatever the mod sends to a real Gemini model ID.
-// FORCE_MODEL pins one model and ignores the mod's choice.
-// Otherwise: try keyword matches, then full passthrough, then DEFAULT_MODEL.
 function pickModelId(requestedModel) {
-  const force = process.env.FORCE_MODEL;
+  const force = process.env.FORCE_MODEL || process.env.AGY_MODEL;
   if (force) return MODEL_ALIASES[force] || force;
-  if (!requestedModel) return MODEL_ALIASES[DEFAULT_MODEL] || DEFAULT_MODEL;
+  if (!requestedModel) return "";
   const m = String(requestedModel).toLowerCase();
   if (m.includes("pro")) return MODEL_ALIASES.pro;
   if (m.includes("flash-3") || m.includes("flash3")) return MODEL_ALIASES["flash-3"];
   if (m.includes("flash")) return MODEL_ALIASES.flash;
   if (m.startsWith("gemini-")) return requestedModel;
-  return MODEL_ALIASES[DEFAULT_MODEL] || DEFAULT_MODEL;
+  return "";
 }
 
 function splitMessages(messages) {
@@ -129,146 +88,119 @@ function splitMessages(messages) {
 
 const DEFAULT_SYSTEM_PROMPT = "You are roleplaying inside a Mount and Blade: Bannerlord scene. Follow the instructions in the user message and respond directly in character. Do not mention being an AI, an assistant, tools, or coding. Reply only with the in-character text the game expects.";
 
-// One gemini CLI process. We pre-spawn these into a per-model pool so the
-// Node-on-Node CLI boot (~2-5s) happens while the server is idle instead of
-// while the player is waiting for the NPC to talk. Each process is one-shot:
-// in headless `-p ""` mode the CLI exits after a single prompt, so after .use()
-// the process is dead and the pool refills with a fresh one.
-class WarmProcess {
-  constructor(model) {
-    this.model = model;
-    this.createdAt = Date.now();
-    this.taken = false;
-    this.dead = false;
-    this.stdout = "";
-    this.stderr = "";
-    this._spawn();
-  }
-
-  _spawn() {
-    const cliArgs = [
-      "-p", "",
-      "--output-format", "json",
-      "--model", this.model,
-      "--yolo",
-    ];
-
-    // In shell:true mode, cmd.exe collapses bare empty-string args, which
-    // would turn `-p ""` into `-p` (no value) and break headless mode.
-    const useShell = GEMINI_LAUNCHER.shell === true;
-    const spawnArgs = useShell
-      ? [...GEMINI_LAUNCHER.baseArgs, ...cliArgs].map((a) => a === "" ? '""' : a)
-      : [...GEMINI_LAUNCHER.baseArgs, ...cliArgs];
-
-    this.child = spawn(GEMINI_LAUNCHER.cmd, spawnArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: useShell,
-      windowsHide: true,
-    });
-
-    this.child.stdout.on("data", (c) => { this.stdout += c.toString("utf8"); });
-    this.child.stderr.on("data", (c) => { this.stderr += c.toString("utf8"); });
-
-    this.exitPromise = new Promise((resolve) => {
-      this.child.once("close", (code) => { this.dead = true; resolve(code); });
-      this.child.once("error", () => { this.dead = true; resolve(-1); });
-    });
-  }
-
-  isFresh() {
-    return !this.dead && !this.taken && (Date.now() - this.createdAt) < POOL_MAX_AGE_MS;
-  }
-
-  async use(stdinPayload, timeoutMs) {
-    this.taken = true;
-    if (this.dead) {
-      throw new Error(`warm process died before use: ${this.stderr.trim() || "no stderr"}`);
-    }
-
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { this.child.kill("SIGKILL"); } catch {}
-    }, timeoutMs);
-
-    this.child.stdin.end(stdinPayload, "utf8");
-    const code = await this.exitPromise;
-    clearTimeout(timer);
-
-    if (timedOut) throw new Error(`gemini CLI timed out after ${timeoutMs}ms`);
-    if (code !== 0) {
-      throw new Error(`gemini exited ${code}: ${this.stderr.trim() || this.stdout.trim()}`);
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(this.stdout);
-    } catch (err) {
-      throw new Error(`failed to parse gemini output: ${err.message}\nstdout: ${this.stdout.slice(0, 500)}`);
-    }
-    if (parsed.error) {
-      throw new Error(`gemini error: ${parsed.error.message || JSON.stringify(parsed.error)}`);
-    }
-    const text = typeof parsed.response === "string" ? parsed.response : "";
-    return { text: String(text).trim(), raw: parsed };
-  }
-
-  kill() {
-    try { this.child.kill("SIGKILL"); } catch {}
-  }
+function stripTerminalControls(text) {
+  return String(text || "")
+    // ANSI CSI/OSC/control sequences.
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+    // Remaining C0 controls except tab/newline/carriage return.
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 }
 
-const warmPools = new Map(); // resolved model id -> WarmProcess[]
+function normalizePtyOutput(output) {
+  const cleaned = stripTerminalControls(output)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .trim();
 
-function ensureWarmPool(model) {
-  if (POOL_SIZE_PER_MODEL <= 0) return;
-  let pool = warmPools.get(model);
-  if (!pool) { pool = []; warmPools.set(model, pool); }
-  // Drop stale/dead processes
-  for (let i = pool.length - 1; i >= 0; i--) {
-    if (!pool[i].isFresh()) { pool[i].kill(); pool.splice(i, 1); }
-  }
-  while (pool.length < POOL_SIZE_PER_MODEL) {
-    pool.push(new WarmProcess(model));
-  }
+  return cleaned;
 }
 
-function takeFromPool(model) {
-  // Schedule a refill regardless of outcome — that way a never-seen-before
-  // model also gets warmed for its next request, not just the next-next one.
-  setImmediate(() => ensureWarmPool(model));
-  const pool = warmPools.get(model);
-  if (!pool) return null;
-  while (pool.length > 0) {
-    const w = pool.shift();
-    if (w.isFresh()) return w;
-    w.kill();
-  }
-  return null;
-}
-
-async function runGemini({ system, prompt, model }) {
+async function runAgy({ system, prompt, model }) {
   const effectiveSystem = system && system.trim().length > 0 ? system : DEFAULT_SYSTEM_PROMPT;
-  // Gemini CLI has no --system-prompt flag in headless mode. Prepend the
-  // system text to the user prompt with a clear marker. Whole payload goes
-  // via stdin (-p "" triggers headless mode without putting the prompt on
-  // the command line, which would hit Windows' ~32 KB arg-length limit).
-  const stdinPayload = effectiveSystem + "\n\n---\n\n" + (prompt || "");
+  const fullPrompt = effectiveSystem + "\n\n---\n\n" + (prompt || "");
+  let requestDir = null;
+  const args = [];
 
-  let proc = takeFromPool(model);
-  const usedWarm = !!proc;
-  if (!proc) proc = new WarmProcess(model);
+  if (model) args.push("--model", model);
+  if (AGY_SKIP_PERMISSIONS) args.push("--dangerously-skip-permissions");
 
-  try {
-    return await proc.use(stdinPayload, REQUEST_TIMEOUT_MS);
-  } catch (err) {
-    // A warm process may die between spawn and use (auth lapse, stale state).
-    // Retry once with a fresh cold spawn so a transient pool failure doesn't
-    // surface to the player as a CLI error.
-    if (!usedWarm) throw err;
-    console.warn("  ~~ warm process failed, retrying cold:", err.message);
-    const fresh = new WarmProcess(model);
-    return await fresh.use(stdinPayload, REQUEST_TIMEOUT_MS);
+  if (AGY_PROMPT_MODE === "inline") {
+    if (os.platform() === "win32" && fullPrompt.length > 28_000) {
+      throw new Error(`agy prompt is ${fullPrompt.length} chars, which is too long for Windows command-line argument mode`);
+    }
+    args.push("--print", fullPrompt, `--print-timeout=${AGY_PRINT_TIMEOUT}`);
+  } else {
+    fs.mkdirSync(AGY_PROMPT_DIR, { recursive: true });
+    requestDir = fs.mkdtempSync(path.join(AGY_PROMPT_DIR, "agy-bannerlord-"));
+    const promptPath = path.join(requestDir, "prompt.txt");
+    fs.writeFileSync(promptPath, fullPrompt, "utf8");
+    const instruction = [
+      "You are servicing a local Mount & Blade II: Bannerlord AI Influence mod request.",
+      `Read the complete UTF-8 prompt from this file: ${promptPath}`,
+      "Follow the instructions inside that file exactly.",
+      "Do not modify files, run shell commands, create artifacts, or explain your process.",
+      "Output only the final in-character response text that should be returned to the game.",
+    ].join("\n");
+    args.push("--add-dir", requestDir, "--print", instruction, `--print-timeout=${AGY_PRINT_TIMEOUT}`);
   }
+
+  return new Promise((resolve, reject) => {
+    let output = "";
+    let settled = false;
+    const startedAt = Date.now();
+    let child;
+
+    const cleanup = () => {
+      if (requestDir) {
+        try { fs.rmSync(requestDir, { recursive: true, force: true }); } catch {}
+      }
+    };
+
+    try {
+      child = pty.spawn(AGY_LAUNCHER, args, {
+        name: "xterm-256color",
+        cols: 240,
+        rows: 80,
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          NO_COLOR: "1",
+          TERM: "dumb",
+        },
+      });
+    } catch (err) {
+      cleanup();
+      reject(err);
+      return;
+    }
+
+    const settle = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      fn();
+    };
+
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      settle(() => reject(new Error(`agy CLI timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+    }, REQUEST_TIMEOUT_MS);
+
+    child.onData((data) => {
+      output += data;
+    });
+
+    child.onExit(({ exitCode, signal }) => {
+      settle(() => {
+        const text = normalizePtyOutput(output);
+        if (exitCode !== 0) {
+          reject(new Error(`agy exited ${exitCode}${signal ? ` (${signal})` : ""}: ${text || "no output"}`));
+          return;
+        }
+        if (!text) {
+          reject(new Error("agy exited successfully but produced no PTY output"));
+          return;
+        }
+        console.log(`  ~~ agy pty captured ${output.length} raw chars -> ${text.length} text chars in ${Date.now() - startedAt}ms`);
+        resolve({ text, raw: { output } });
+      });
+    });
+  });
 }
 
 app.get("/", (_req, res) => {
@@ -276,7 +208,7 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/api/version", (_req, res) => {
-  res.json({ version: "0.1.50-gemini-proxy" });
+  res.json({ version: "0.2.0-antigravity-proxy" });
 });
 
 app.get("/api/tags", (_req, res) => {
@@ -287,12 +219,12 @@ app.get("/api/tags", (_req, res) => {
       model: tag,
       modified_at: now,
       size: 0,
-      digest: "sha256:gemini",
+      digest: "sha256:antigravity",
       details: {
         parent_model: "",
         format: "gguf",
-        family: "gemini",
-        families: ["gemini"],
+        family: "antigravity",
+        families: ["antigravity"],
         parameter_size: "N/A",
         quantization_level: "N/A",
       },
@@ -303,14 +235,14 @@ app.get("/api/tags", (_req, res) => {
 app.post("/api/show", (req, res) => {
   const name = req.body?.name || "gemini-flash:latest";
   res.json({
-    modelfile: `# Gemini proxy: ${name}`,
+    modelfile: `# Antigravity proxy: ${name}`,
     parameters: "",
     template: "{{ .Prompt }}",
     details: {
       parent_model: "",
       format: "gguf",
-      family: "gemini",
-      families: ["gemini"],
+      family: "antigravity",
+      families: ["antigravity"],
       parameter_size: "N/A",
       quantization_level: "N/A",
     },
@@ -319,14 +251,14 @@ app.post("/api/show", (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   const { model, messages, stream } = req.body || {};
-  const geminiModel = pickModelId(model);
+  const providerModel = pickModelId(model);
   const { system, userPrompt } = splitMessages(messages);
 
-  console.log(`  -> /api/chat model=${model} -> ${geminiModel}, msgs=${messages?.length ?? 0}, stream=${!!stream}, sysLen=${system.length}, promptLen=${userPrompt.length}`);
+  console.log(`  -> /api/chat model=${model} -> ${providerModel || "(agy default)"}, msgs=${messages?.length ?? 0}, stream=${!!stream}, sysLen=${system.length}, promptLen=${userPrompt.length}`);
   const t0 = Date.now();
 
   try {
-    const { text } = await runGemini({ system, prompt: userPrompt, model: geminiModel });
+    const { text } = await runAgy({ system, prompt: userPrompt, model: providerModel });
     const dt = Date.now() - t0;
     console.log(`  <- /api/chat done in ${dt}ms, replyLen=${text.length}`);
     const now = new Date().toISOString();
@@ -376,13 +308,13 @@ app.post("/api/chat", async (req, res) => {
 
 app.post("/api/generate", async (req, res) => {
   const { model, prompt, system, stream } = req.body || {};
-  const geminiModel = pickModelId(model);
+  const providerModel = pickModelId(model);
 
-  console.log(`  -> /api/generate model=${model} -> ${geminiModel}, stream=${!!stream}, sysLen=${(system||"").length}, promptLen=${(prompt||"").length}`);
+  console.log(`  -> /api/generate model=${model} -> ${providerModel || "(agy default)"}, stream=${!!stream}, sysLen=${(system||"").length}, promptLen=${(prompt||"").length}`);
   const t0 = Date.now();
 
   try {
-    const { text } = await runGemini({ system: system || "", prompt: prompt || "", model: geminiModel });
+    const { text } = await runAgy({ system: system || "", prompt: prompt || "", model: providerModel });
     const dt = Date.now() - t0;
     console.log(`  <- /api/generate done in ${dt}ms`);
     const now = new Date().toISOString();
@@ -429,12 +361,14 @@ app.use((req, res) => {
 
 app.listen(PORT, HOST, () => {
   console.log("=====================================================");
-  console.log(" Gemini -> Ollama proxy for Bannerlord AIInfluence");
+  console.log(" Antigravity -> Ollama proxy for Bannerlord AIInfluence");
   console.log("=====================================================");
   console.log(` Listening on  http://${HOST}:${PORT}`);
-  console.log(` Gemini bin    ${GEMINI_LAUNCHER.cmd} ${GEMINI_LAUNCHER.baseArgs.join(" ")}`);
-  console.log(` Default model ${DEFAULT_MODEL} (${MODEL_ALIASES[DEFAULT_MODEL] || DEFAULT_MODEL})`);
-  console.log(` Warm pool     ${POOL_SIZE_PER_MODEL} per model (set GEMINI_POOL_SIZE=0 to disable)`);
+  console.log(` Antigravity   ${AGY_LAUNCHER}`);
+  console.log(` AGY model     ${process.env.AGY_MODEL || "(Antigravity default)"}`);
+  console.log(` AGY timeout   ${AGY_PRINT_TIMEOUT}`);
+  console.log(` AGY prompt    ${AGY_PROMPT_MODE}${AGY_PROMPT_MODE === "file" ? ` (${AGY_PROMPT_DIR})` : ""}`);
+  console.log(` AGY perms     ${AGY_SKIP_PERMISSIONS ? "auto-approve" : "default"}`);
   console.log("");
   console.log(" In Bannerlord MCM > AIInfluence:");
   console.log("   Provider     = Ollama");
@@ -445,17 +379,9 @@ app.listen(PORT, HOST, () => {
   console.log("");
   console.log(" Logs from each request appear below. Ctrl+C to stop.");
   console.log("-----------------------------------------------------");
-
-  // Pre-warm the default model so the very first request also skips the
-  // ~2-5s CLI cold start. Other models get warmed on first use.
-  const defaultGeminiModel = MODEL_ALIASES[DEFAULT_MODEL] || DEFAULT_MODEL;
-  ensureWarmPool(defaultGeminiModel);
 });
 
 function shutdown() {
-  for (const pool of warmPools.values()) {
-    for (const w of pool) w.kill();
-  }
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
