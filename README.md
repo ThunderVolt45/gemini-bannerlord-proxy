@@ -79,6 +79,7 @@ Set these in `start.bat` before `node server.js`, or in your shell before `npm s
 | `AGY_PROMPT_MODE`      | `file`        | `file` writes the full prompt to a temp file; `inline` passes it as an arg |
 | `AGY_PROMPT_DIR`       | OS temp dir   | Root directory for per-request prompt files                               |
 | `AGY_SKIP_PERMISSIONS` | `0`           | Set `1` to pass `--dangerously-skip-permissions` to `agy`                 |
+| `AGY_REUSE_WINDOWS_PTY`| `1`           | Reuse one Windows PTY to avoid per-request console focus stealing          |
 
 ---
 
@@ -96,7 +97,7 @@ This Express proxy on :11434
 Antigravity CLI: agy --print
 ```
 
-Antigravity prints model output to the terminal/TTY rather than to a normal Node `stdout` pipe, so the proxy runs it through `node-pty` and captures the pseudo-terminal output.
+Antigravity prints model output to the terminal/TTY rather than to a normal Node `stdout` pipe, so the proxy runs it through `node-pty` and captures the pseudo-terminal output. On Windows, the default file prompt mode reuses one background PTY and runs each AGY request inside it, which avoids creating a fresh console host for every AI Influence call.
 
 By default, the proxy avoids Windows command-line length limits by writing the full AI Influence prompt to a per-request `prompt.txt` in a temporary folder. `agy --print` receives only a short instruction to read that file and return the final in-character response. The temp folder is removed after the request finishes.
 
@@ -134,7 +135,7 @@ npm run test:agy -- "Reply with exactly OK."
 - **Permissions.** File prompt mode may require AGY to read the temporary prompt file. If it stalls on a permission prompt, trust the prompt directory in AGY or set `AGY_SKIP_PERMISSIONS=1` after considering the risk.
 - **Latency.** `agy --print` starts an AGY run for each request. Expect noticeably higher latency than a direct API call.
 - **Agent behavior.** AGY is an agent surface, not a pure text-completion API. The proxy prompts it to avoid file edits, shell commands, artifacts, and process explanations, but real game prompts should still be tested.
-- **Parallel requests.** Each incoming request starts its own AGY process. If the mod sends many requests at once, they may compete for CPU, AGY quota, or permissions.
+- **Parallel requests.** On Windows with PTY reuse enabled, requests are queued and run one at a time in the reusable PTY. Other modes may start one AGY process per request, so many simultaneous requests can still compete for CPU, AGY quota, or permissions.
 
 ---
 

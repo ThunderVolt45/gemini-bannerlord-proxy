@@ -16,6 +16,8 @@ REM Prompt mode: file avoids Windows command-line length limits.
 REM set AGY_PROMPT_MODE=file
 REM Optional temp root for per-request prompt files.
 REM set AGY_PROMPT_DIR=%TEMP%
+REM Windows default: reuse one PTY so per-request AGY calls do not steal game focus.
+REM set AGY_REUSE_WINDOWS_PTY=1
 REM Optional: auto-approve AGY tool permissions. Use only if you trust the prompt.
 REM set AGY_SKIP_PERMISSIONS=1
 

@@ -12,6 +12,7 @@ const AGY_PRINT_TIMEOUT = process.env.AGY_PRINT_TIMEOUT || `${Math.ceil(REQUEST_
 const AGY_PROMPT_MODE = (process.env.AGY_PROMPT_MODE || "file").toLowerCase();
 const AGY_PROMPT_DIR = process.env.AGY_PROMPT_DIR || os.tmpdir();
 const AGY_SKIP_PERMISSIONS = process.env.AGY_SKIP_PERMISSIONS === "1";
+const AGY_REUSE_WINDOWS_PTY = process.env.AGY_REUSE_WINDOWS_PTY !== "0";
 
 const MODEL_ALIASES = {
   flash: "gemini-3.5-flash",
@@ -40,6 +41,8 @@ function resolveAgyLauncher() {
 }
 
 const AGY_LAUNCHER = resolveAgyLauncher();
+let reusableWindowsPty = null;
+let reusableWindowsPtyQueue = Promise.resolve();
 
 const ADVERTISED_MODELS = [
   { tag: "gemini-flash:latest", alias: "flash" },
@@ -109,6 +112,128 @@ function normalizePtyOutput(output) {
   return cleaned;
 }
 
+function windowsPtyOptions() {
+  return {
+    name: "xterm-256color",
+    cols: 240,
+    rows: 80,
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NO_COLOR: "1",
+      TERM: "dumb",
+    },
+    useConpty: true,
+    useConptyDll: true,
+  };
+}
+
+function quoteCmdArg(value) {
+  const text = String(value ?? "");
+  return `"${text.replace(/"/g, '\\"')}"`;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function ensureReusableWindowsPty() {
+  if (reusableWindowsPty && !reusableWindowsPty.exited) return reusableWindowsPty;
+
+  const session = {
+    term: pty.spawn("cmd.exe", [], windowsPtyOptions()),
+    currentJob: null,
+    exited: false,
+  };
+
+  session.term.onData((data) => {
+    const job = session.currentJob;
+    if (!job) return;
+
+    job.output += data;
+    const startIndex = job.output.indexOf(job.startToken);
+    if (startIndex === -1) return;
+
+    const afterStartIndex = startIndex + job.startToken.length;
+    const endMatch = new RegExp(`${escapeRegExp(job.endToken)}(-?\\d+)`).exec(job.output.slice(afterStartIndex));
+    if (!endMatch) return;
+
+    const raw = job.output.slice(afterStartIndex, afterStartIndex + endMatch.index);
+    const exitCode = Number(endMatch[1]);
+    session.currentJob = null;
+    job.resolve({ exitCode, output: raw });
+  });
+
+  session.term.onExit(({ exitCode, signal }) => {
+    session.exited = true;
+    if (session.currentJob) {
+      const job = session.currentJob;
+      session.currentJob = null;
+      job.reject(new Error(`reusable Windows PTY exited ${exitCode}${signal ? ` (${signal})` : ""}`));
+    }
+    if (reusableWindowsPty === session) reusableWindowsPty = null;
+  });
+
+  session.term.write("@echo off\r");
+  reusableWindowsPty = session;
+  return session;
+}
+
+function killReusableWindowsPty() {
+  if (!reusableWindowsPty) return;
+  try { reusableWindowsPty.term.kill(); } catch {}
+  reusableWindowsPty = null;
+}
+
+function writeAgyBatchFile({ args, requestDir, requestId }) {
+  const startToken = `__AGY_PROXY_START_${requestId}__`;
+  const endToken = `__AGY_PROXY_END_${requestId}__`;
+  const scriptPath = path.join(requestDir, "run-agy.cmd");
+  const launcherExt = path.extname(AGY_LAUNCHER).toLowerCase();
+  const commandPrefix = launcherExt === ".bat" || launcherExt === ".cmd" ? "call " : "";
+  const command = `${commandPrefix}${quoteCmdArg(AGY_LAUNCHER)} ${args.map(quoteCmdArg).join(" ")}`;
+
+  fs.writeFileSync(scriptPath, [
+    "@echo off",
+    `echo ${startToken}`,
+    `cd /d ${quoteCmdArg(process.cwd())}`,
+    "set NO_COLOR=1",
+    "set TERM=dumb",
+    command,
+    "set AGY_PROXY_EXIT=%ERRORLEVEL%",
+    `echo ${endToken}%AGY_PROXY_EXIT%`,
+    "",
+  ].join("\r\n"), "utf8");
+
+  return { scriptPath, startToken, endToken };
+}
+
+function runAgyInReusableWindowsPty({ args, requestDir }) {
+  const run = () => new Promise((resolve, reject) => {
+    const requestId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const { scriptPath, startToken, endToken } = writeAgyBatchFile({ args, requestDir, requestId });
+    const session = ensureReusableWindowsPty();
+    const job = {
+      startToken,
+      endToken,
+      output: "",
+      resolve,
+      reject,
+    };
+
+    session.currentJob = job;
+    session.term.write(`${quoteCmdArg(scriptPath)}\r`);
+  });
+
+  const queued = reusableWindowsPtyQueue.then(run, run);
+  reusableWindowsPtyQueue = queued.catch(() => {});
+  return queued;
+}
+
+function shouldReuseWindowsPty() {
+  return os.platform() === "win32" && AGY_REUSE_WINDOWS_PTY && AGY_PROMPT_MODE !== "inline";
+}
+
 async function runAgy({ system, prompt, model }) {
   const effectiveSystem = system && system.trim().length > 0 ? system : DEFAULT_SYSTEM_PROMPT;
   const fullPrompt = effectiveSystem + "\n\n---\n\n" + (prompt || "");
@@ -134,7 +259,7 @@ async function runAgy({ system, prompt, model }) {
       "Follow the instructions inside that file exactly.",
       "Do not modify files, run shell commands, create artifacts, or explain your process.",
       "Output only the final in-character response text that should be returned to the game.",
-    ].join("\n");
+    ].join(" ");
     args.push("--add-dir", requestDir, "--print", instruction, `--print-timeout=${AGY_PRINT_TIMEOUT}`);
   }
 
@@ -150,17 +275,45 @@ async function runAgy({ system, prompt, model }) {
       }
     };
 
+    if (shouldReuseWindowsPty()) {
+      const timer = setTimeout(() => {
+        killReusableWindowsPty();
+        settle(() => reject(new Error(`agy CLI timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+      }, REQUEST_TIMEOUT_MS);
+
+      const settle = (fn) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        fn();
+      };
+
+      runAgyInReusableWindowsPty({ args, requestDir })
+        .then(({ exitCode, output }) => {
+          settle(() => {
+            const text = normalizePtyOutput(output);
+            if (exitCode !== 0) {
+              reject(new Error(`agy exited ${exitCode}: ${text || "no output"}`));
+              return;
+            }
+            if (!text) {
+              reject(new Error("agy exited successfully but produced no PTY output"));
+              return;
+            }
+            console.log(`  ~~ agy reused Windows PTY captured ${output.length} raw chars -> ${text.length} text chars in ${Date.now() - startedAt}ms`);
+            resolve({ text, raw: { output } });
+          });
+        })
+        .catch((err) => {
+          settle(() => reject(err));
+        });
+      return;
+    }
+
     try {
       child = pty.spawn(AGY_LAUNCHER, args, {
-        name: "xterm-256color",
-        cols: 240,
-        rows: 80,
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          NO_COLOR: "1",
-          TERM: "dumb",
-        },
+        ...windowsPtyOptions(),
       });
     } catch (err) {
       cleanup();
@@ -368,6 +521,7 @@ app.listen(PORT, HOST, () => {
   console.log(` AGY model     ${process.env.AGY_MODEL || "(Antigravity default)"}`);
   console.log(` AGY timeout   ${AGY_PRINT_TIMEOUT}`);
   console.log(` AGY prompt    ${AGY_PROMPT_MODE}${AGY_PROMPT_MODE === "file" ? ` (${AGY_PROMPT_DIR})` : ""}`);
+  console.log(` AGY PTY reuse ${shouldReuseWindowsPty() ? "enabled" : "disabled"}`);
   console.log(` AGY perms     ${AGY_SKIP_PERMISSIONS ? "auto-approve" : "default"}`);
   console.log("");
   console.log(" In Bannerlord MCM > AIInfluence:");
@@ -382,6 +536,7 @@ app.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
+  killReusableWindowsPty();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
